@@ -1,0 +1,17 @@
+####################################
+## 			PERMS FILE			  ##
+## element user group permissions ##
+####################################
+
+admin root root 755
+etc root root 755
+
+admin/ERICsentinel.tar.gz root root 755
+admin/eniq_sentinel_install.bsh root root 755
+admin/version root root 755
+
+etc/sentinel.env root root 755
+etc/sentinel_opts root root 755
+
+version root root 755
+version/pkginfo root root 444

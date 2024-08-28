@@ -1,0 +1,1039 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2018 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+#
+# ********************************************************************
+# Name    : eniq_sentinel_install.sh
+# Updated : 16/10/2023
+# Revision: main\11
+# Purpose :
+#
+# ********************************************************************
+#
+#               Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CP=/usr/bin/cp
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+GUNZIP=/usr/bin/gunzip
+HEAD=/usr/bin/head
+HOSTNAME=/usr/bin/hostname
+KILL=/usr/bin/kill
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+TAR=/usr/bin/tar
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+UNAME=/usr/bin/uname
+WAIT=wait
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+#
+# Tar.gz file containing Sentinel Server
+readonly SENTINEL_SERVER_FILE="ERICsentinel.tar.gz"
+
+# Installation script to install Sentinel Server Binaries,
+readonly SENTINEL_INSTALL_SCRIPT="ERICsentinel/install_sentinel.bsh"
+
+# Target installation directory, where Sentinel RMS License Server should be installed
+readonly TARGET_SENTINEL_INSTALLATION_DIR="/eniq/sentinel"
+export TARGET_SENTINEL_INSTALLATION_DIR
+
+readonly SERVER_HOSTNAME=`$HOSTNAME`
+
+# Configuration Files
+readonly SERVICE_FILE="licensing-sentinel.service"
+readonly METHOD_FILE="sentinel.sh"
+readonly SENTINEL_SYSTEMD="ERICsentinel/systemd/"
+readonly SENTINEL_SYSTEMD_METHOD="ERICsentinel/systemd/${METHOD_FILE}"
+readonly SERVICE_DIR="/etc/systemd/system"
+readonly METHOD_DIR="/eniq/smf/bin/"
+readonly SENTINEL_SERVICE_NAME="licensing-sentinel.service"
+readonly ENIQ_CONF_DIR="/eniq/installation/config"
+readonly SUNOS_INI="SunOS.ini"
+readonly ENIQ_SENTINEL_ENV="/eniq/sentinel/etc/sentinel.env"
+
+readonly ENIQ_SENTINEL_BIN_DIR="/eniq/sentinel/bin"
+readonly ENIQ_BASE_DIR="/eniq"
+readonly ENIQ_INST_DIR="${ENIQ_BASE_DIR}/installation"
+readonly ENIQ_CORE_INST_DIR="${ENIQ_INST_DIR}/core_install"
+readonly IP_TYPE="ip_type"
+
+if [ -f ${ENIQ_CONF_DIR}/${IP_TYPE} ]; then
+    #get ip type from ip_type file
+    _ip_type_=`$CAT ${ENIQ_CONF_DIR}/${IP_TYPE} | ${AWK} '{print $1}' | ${HEAD} -1`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not read IP Type from ${ENIQ_CONF_DIR}/${IP_TYPE} file"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+#Common Libraries
+readonly ENIQ_LIB_DIR="/eniq/installation/core_install/lib"
+
+# Temp Installation Directory
+TEMP_INST_DIR="/tmp/sentinel_install/"
+
+# Update version file
+UPDATE_VERSION_FILE="version"
+
+# ********************************************************************
+#
+#               Functions
+#
+# ********************************************************************
+#
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted through an error
+#   signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+_err_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ "$1" ]; then
+        _err_msg_="${_err_time_} - $1"
+else
+        _err_msg_="${_err_time_} - ERROR : Script aborted.......\n"
+fi
+
+if [ "${SENTINEL_LOGFILE}" ]; then
+        $ECHO "\nERROR : $_err_msg_\n" | $TEE -a ${SENTINEL_LOGFILE}
+else
+        $ECHO "\nERROR : $_err_msg_\n"
+fi
+
+cleanup
+exit 1
+}
+
+### Function: check_version ###
+#
+#  Checks version of Sentinel server
+#
+# Arguments:  none
+# Return Values: 0 for success
+#                10 if existing version is up to date
+check_version()
+{
+if [ -s "${TARGET_SENTINEL_INSTALLATION_DIR}/version" -a -s "${UPDATE_VERSION_FILE}" ]; then
+        _installed_version=`$CAT ${TARGET_SENTINEL_INSTALLATION_DIR}/version | $EGREP '^[[:blank:]]*VERSION=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+        _update_version=`$CAT ${UPDATE_VERSION_FILE} | $EGREP '^[[:blank:]]*VERSION=' | $AWK -F\= '{print $2}' | $SED -e 's|"||g'`
+        if [[ ${_installed_version} -ge ${_update_version} ]]; then
+                return 10
+        else
+                return 0
+        fi
+else
+        logit "Version files not found."
+        return 0
+fi
+}
+
+### Function: add_licenses ###
+#
+#  Adds Sentinel Licenses to Sentinel server
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables: ENVIRONMENT_FILE to set LSHOST; LICENSE_FILE
+#
+add_licenses()
+{
+if [ ! -z ${ENVIRONMENT_FILE} -a -s ${ENVIRONMENT_FILE} ]; then
+        logit "Environment file found. Reading environment.\n"
+        . ${ENVIRONMENT_FILE}
+else
+        logit "Environment file not found.\n"
+fi
+if [[ -z ${LSHOST} ]]; then
+        logit "ERROR:: Environment variable LSHOST not set. Cannot add licenses"
+        return 1
+fi
+
+# Set a timeout for adding licenses
+if [[ -z ${add_license_timeout} ]]; then
+        add_license_timeout=120
+fi
+_loop_sleep=5
+let "_max_loop_iterations=${add_license_timeout} / ${_loop_sleep}"
+
+LIC_ADD_PID_LIST=""
+export LSFORCEHOST
+BACKUP_IFS="${IFS}"
+IFS=:
+_count_=0
+_fail_count=0
+_success_count=0
+
+if [ "${_ip_type_}" == "IPv4" ]; then
+    for LSFORCEHOST in ${LSHOST}; do
+        ${TARGET_SENTINEL_INSTALLATION_DIR}/bin/lslic -F ${LICENSE_FILE} >> /dev/null 2>&1 &
+        LIC_ADD_PID_LIST="${LIC_ADD_PID_LIST} $!"
+        _server[$_count_]=${LSFORCEHOST}
+        let "_count_+=1"
+    done
+elif [ "${_ip_type_}" == "IPv6" ]; then
+    ${TARGET_SENTINEL_INSTALLATION_DIR}/bin/lslic -F ${LICENSE_FILE} >> /dev/null 2>&1 &
+    LIC_ADD_PID_LIST="${LIC_ADD_PID_LIST} $!"
+    _server[$_count_]=${LSHOST}
+    let "_count_+=1"
+else
+    _err_msg_="Unable to fetch IP Type from ${ENIQ_CONF_DIR}/${IP_TYPE} file"
+    abort_script "$_err_msg_"
+ fi
+
+IFS="${BACKUP_IFS}"
+$SLEEP ${_loop_sleep}
+_loop_no=0
+
+# Check if all licenses added ok, if yes great, or if no, wait and try again.
+# Repeat loop until the timeout value for adding licenses is reached.
+while [ ${_loop_no} -le ${_max_loop_iterations} ]; do
+        # check if all licenses installed.
+        for _lic_add_pid in ${LIC_ADD_PID_LIST}; do
+                ${KILL} -0 ${_lic_add_pid} >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        # Licenses have not added on at least one server, maybe we should sleep and check later
+                        $SLEEP ${_loop_sleep}
+                        let "_loop_no+=1"
+                        continue 2
+                fi
+        done
+        let "_loop_no+=1"
+done
+
+_count_=0
+_fail_count=0
+_success_count=0
+
+# check if licenses installed.
+for _lic_add_pid in ${LIC_ADD_PID_LIST}; do
+        ${KILL} -0 ${_lic_add_pid} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+                # Adding licenses should have finished by now.
+                logit "WARNING:: Licenses did not add to server '${_server[$_count_]}' TimeOut Limit reached; killing pid ${_lic_add_pid}"
+                ${KILL} ${_lic_add_pid} >> /dev/null 2>&1
+                let "_fail_count+=1"
+        else
+                ${WAIT} ${_lic_add_pid} >> /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                        logit "Licenses successfully added to server '${_server[$_count_]}'"
+                        let "_success_count+=1"
+                elif [ $? -eq 93 ]; then
+                        logit "Licenses already added to server '${_server[$_count_]}'"
+                        let "_success_count+=1"
+                elif [ $? -eq 92 ]; then
+                        logit "Licenses invalid '${_server[$_count_]}' "
+                        let "_fail_count+=1"
+                else
+                        logit "Unable to determine if licenses were added to server '${_server[$_count_]}'"
+                fi
+        fi
+let "_count_+=1"
+done
+
+
+if [ ${_fail_count} -eq ${_count_} ]; then
+        logit "\nERROR:: Licenses failed to add on all '${_fail_count}' servers"
+        return 1
+elif [ ${_fail_count} -ne 0 ]; then
+        logit "\nWARNING:: Licenses failed to add on '${_fail_count}' servers"
+fi
+
+if [ ${_success_count} -ne 0 ]; then
+        logit "Licenses added on '${_success_count}' servers"
+fi
+}
+
+### Function: chk_create_logfile ###
+#
+# Check/Create Logfile
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+chk_create_logfile()
+{
+$MKDIR -p `$DIRNAME ${SENTINEL_LOGFILE}`
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: Could not create directory `$DIRNAME ${SENTINEL_LOGFILE}`"
+fi
+
+$TOUCH -a ${SENTINEL_LOGFILE}
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: Could not write to file ${SENTINEL_LOGFILE}"
+fi
+
+export SENTINEL_LOGFILE
+}
+
+### Function: cleanup ###
+#
+#  Deletes temporary files.
+#
+# Arguments:  none
+# Return Values: 0 for success
+cleanup ()
+{
+cd $SCRIPTHOME
+$RM -rf ${TEMP_INST_DIR}
+}
+
+### Function: delete_SMF ###
+#
+#       Installation Type
+#  Use Remote Sentinel Server.
+#  Removes SMF for Local Sentinel Server
+#
+# Arguments:  none
+# Return Values: 0 for success
+delete_SMF()
+{
+logit "Starting to remove SentinelLM SMF manifest if it exists"
+
+#stop sentinel, if it exists
+stop_sentinel
+if [ $? -ne 0 ]; then
+        _err_msg_="Problem stopping Sentinel....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# Delete the SMF manifest for the Sentinel License server
+delete_manifest
+
+# Delete SMF files for local Sentinel Server
+delete_SMF_manifest_files
+if [ $? -eq 0 ]; then
+        logit "Successfully deleted SMF files for local Sentinel Server"
+else
+        _err_msg_="Problem deleting SMF files for local SentinelLM server....Exiting"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: delete_manifest ###
+#
+#  Deletes sentinel from the SMF Manifest
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  SENTINEL_SERVICE_NAME
+#
+delete_manifest()
+{
+logit "Deleting Sentinel SMF Manifest"
+_service_state=`$SVCS -a | $GREP ${SENTINEL_SERVICE_NAME} | $AWK '{print $1}'`
+
+if [ ! ${_service_state} ]; then
+        logit "The SMF Manifest for ${SENTINEL_SERVICE_NAME} does not exist."
+else
+        $SVCCFG delete ${SENTINEL_SERVICE_NAME} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                _err_msg_="Could not delete manifest for local SentinelLM server...Exiting"
+                abort_script "$_err_msg_"
+        else
+                logit "Deleted the SMF Manifest for ${SENTINEL_SERVICE_NAME}"
+                return 0
+        fi
+fi
+}
+
+### Function: delete_SMF_manifest_files ###
+#
+#  Deletes the SMF manifest and method files
+#
+# Arguments:  none
+# Return Values: 0 for success
+delete_SMF_manifest_files()
+{
+logit "Deleting Sentinel SMF manifest file '${SERVICE_DIR}/${SERVICE_FILE}'"
+if [ -d ${SERVICE_DIR} -a -s ${SERVICE_DIR}/${SERVICE_FILE} ]; then
+        $RM ${SERVICE_DIR}${SERVICE_FILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                logit "\nERROR:: Deleting Sentinel SMF manifest file; '${SERVICE_DIR}/${SERVICE_FILE}'"
+                return 1
+        else
+                logit "Successfully deleted SentinelLM SMF manifest file '${SERVICE_DIR}/${SERVICE_FILE}'"
+        fi
+else
+        logit "Manifest file '${SERVICE_DIR}/${SERVICE_FILE}' could not be found."
+        return 0
+fi
+
+logit "Deleting SentinelLM SMF method file - '${METHOD_DIR}${METHOD_FILE}'"
+if [ -d ${METHOD_DIR} -a -s ${METHOD_DIR}${METHOD_FILE} ]; then
+        $RM ${METHOD_DIR}${METHOD_FILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                logit "ERROR: Deleting Sentinel SMF method file; '${METHOD_DIR}${METHOD_FILE}'"
+                return 1
+        else
+                logit "Successfully deleted SentinelLM SMF method file - '${METHOD_DIR}${METHOD_FILE}'"
+        fi
+else
+        logit "Manifest file '${METHOD_DIR}${METHOD_FILE}' could not be found."
+        return 0
+fi
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:     none
+# Return Values: none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: reload_service ###
+#
+#  Reloads the configuration file for Sentinel Licensing Server
+#
+# Arguments:  none
+# Return Values: 0 for success
+reload_service()
+{
+logit "Updating the configuration file via systemctl daemon-reload"
+$SYSTEMCTL daemon-reload >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        _err_msg_="Could not update the service configuration file"
+        abort_script "$_err_msg_"
+else
+        logit "Successfully updated configuration for SentinelLM server"
+fi
+}
+
+### Function: install_service_file ###
+#
+#  Installs Sentinel configuration file and start/stop script for Sentinel Licensing Server
+#
+# Arguments:  none
+# Return Values: 0 for success
+#
+install_service_file()
+{
+
+# Need to become storage aware and copy the correct file
+read_storage_type
+if [ $? -ne 0 ]; then
+        logit "Could not determine system storage type"
+        return 1
+fi
+
+logit "Copying the Sentinel LM service file."
+$CP ${TEMP_INST_DIR}/${SENTINEL_SYSTEMD}/${STORAGE_TYPE}/${SERVICE_FILE} ${SERVICE_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: running command $CP ${TEMP_INST_DIR}/${SENTINEL_SYSTEMD} ${SERVICE_DIR} "
+        return 1
+fi
+$CHOWN -R root:sys ${SERVICE_DIR}/${SERVICE_FILE}
+$CHMOD  444 ${SERVICE_DIR}/${SERVICE_FILE}
+
+# Install start/stop method script for sentinel LM service
+if [ ! -d ${METHOD_DIR} ]; then
+        logit "${METHOD_DIR} does not exist. Creating it."
+        $MKDIR -p ${METHOD_DIR} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+                logit "\nERROR:: creating directory ${METHOD_DIR}"
+                return 1
+        fi
+        $CHOWN -R root:sys ${METHOD_DIR}
+        $CHMOD  750 ${METHOD_DIR}
+fi
+
+logit "Copying the sentinel systemd method file."
+$CP ${TEMP_INST_DIR}/${SENTINEL_SYSTEMD_METHOD} ${METHOD_DIR} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: running command $CP ${TEMP_INST_DIR}/${SENTINEL_SYSTEMD_METHOD} ${METHOD_DIR} "
+        return 1
+fi
+
+$CHOWN -R root:sys ${METHOD_DIR}${METHOD_FILE}
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: Could not change ownership of ${METHOD_DIR}${METHOD_FILE} to root:sys"
+        return 1
+fi
+
+$CHMOD 750 ${METHOD_DIR}${METHOD_FILE}
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: Could not change permissions on ${METHOD_DIR}${METHOD_FILE} to -rwxr-w---"
+        return 1
+fi
+}
+
+### Function: install_sentinel ###
+#
+#  Installs Sentinel Licensing Server
+#
+# Arguments:  none
+# Return Values: 0 for success
+install_sentinel()
+{
+$BASH ${TEMP_INST_DIR}/${SENTINEL_INSTALL_SCRIPT} >> ${SENTINEL_LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+        _err_msg_="Problem running command running command $BASH ${TEMP_INST_DIR}/${SENTINEL_INSTALL_SCRIPT} >> ${SENTINEL_LOGFILE} 2>&1"
+        abort_script "$_err_msg_"
+else
+        logit "Successfully installed SentinelLM server"
+fi
+}
+
+### Function: install_sentinel_binaires_only ###
+#
+#       Installation Type
+#  Installs Sentinel Licensing Server Binaries
+#
+# Arguments:  none
+# Return Values: 0 for success
+install_sentinel_binaires_only()
+{
+logit "\Starting to install Sentinel binaries only "
+
+if [ "${FORCE_INSTALL}" != "true" ]; then
+    check_version
+    if [ $? -ne 0 ]; then
+        logit "Installed Sentinel Server already at latest version."
+        logit "Upgrade not required. Skipping."
+        return 0
+    fi
+fi
+
+# stop sentinel, if it exists
+stop_sentinel
+if [ $? -ne 0 ]; then
+        _err_msg_="Problem stopping Sentinel....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# unzip the sentinel software to temporary directory.
+unpack_sentinel
+if [ $? -eq 0 ]; then
+        logit "Successfully unpacked SentinelLM server software"
+else
+        _err_msg_="Problem unpacking SentinelLM server....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# Install the Sentinel License Server
+install_sentinel
+
+# Restart sentinel service if it was stopped by this function.
+if [ "${I_STOPPED_SENTINEL}" == "true" -a "$START_SENTINEL" == "true" ]; then
+        start_sentinel_service
+        if [ $? -eq 0 ]; then
+                logit "Successfully restarted Sentinel Server"
+        else
+                _err_msg_="Problem starting SentinelLM....Exiting"
+                abort_script "$_err_msg_"
+        fi
+fi
+}
+
+### Function: install_sentinel_binaires_and_SYSTEMD ###
+#
+#  Installation Type
+#  Installs Sentinel locally
+#
+# Arguments:  none
+# Return Values: 0 for success
+install_sentinel_binaires_and_SYSTEMD()
+{
+logit "Starting to install SentinelLM binaries and SYSTEMD"
+
+if [ "${FORCE_INSTALL}" != "true" ]; then
+        check_version
+        if [ $? -ne 0 ]; then
+                logit "Installed SentinelLM already at latest version."
+                logit "Upgrade not required. Skipping."
+                return 0
+        fi
+fi
+
+# stop sentinel service, if it exists
+
+stop_sentinel
+if [ $? -ne 0 ]; then
+        _err_msg_="Problem stopping Sentinel service....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# unzip the sentinel software to temporary directory.
+unpack_sentinel
+if [ $? -eq 0 ]; then
+        logit "Successfully unpacked SentinelLM server software"
+else
+        _err_msg_="Problem unpacking SentinelLM server....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# Install the Sentinel License Server
+install_sentinel
+
+# Install the SMF manifest for the Sentinel License server
+install_service_file
+if [ $? -eq 0 ]; then
+        logit "Successfully installed SentinelLM server"
+else
+        _err_msg_="Could not install SentinelLM file"
+        abort_script "$_err_msg_"
+fi
+
+# Starts Sentinel Server by reloading the configuration file"
+reload_service
+
+# Restart Sentinel service if the START_SENTINEL flag is set to true
+
+if [ "$START_SENTINEL" == "false" ]; then
+    start_Sentinel ${ENIQ_SENTINEL_BIN_DIR} ${ENIQ_SENTINEL_ENV} ${LOGFILE}
+    if [ $? -eq 0 ]; then
+        logit "Successfully started Sentinel Server"
+    else
+        _err_msg_="Could not start SentinelLM "
+        abort_script "$_err_msg_"
+    fi
+
+elif [ "$START_SENTINEL" == "true" ]; then
+        start_sentinel_service
+    if [ $? -eq 0 ]; then
+        logit "Successfully restarted Sentinel Server"
+    else
+                _err_msg_="Could not start SentinelLM via systemctl"
+                abort_script "$_err_msg_"
+    fi
+
+else
+        _err_msg_="START_SENTINEL flag not set , Sentinel not started"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: install_systemd_only ###
+#
+#       Installation Type
+#  Installs SMF for Sentinel
+#
+# Arguments:  none
+# Return Values: 0 for success
+install_systemd_only()
+{
+logit "Starting to install SentinelLM systemd only "
+
+if [ "${FORCE_INSTALL}" != "true" ]; then
+        check_version
+        if [ $? -ne 0 ]; then
+                logit "Installed Sentinel already at latest version."
+        fi
+fi
+
+# stop sentinel, if it exists
+stop_sentinel
+if [ $? -ne 0 ]; then
+        _err_msg_="Problem stopping Sentinel....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# unzip the sentinel software to temporary directory.
+unpack_sentinel
+if [ $? -eq 0 ]; then
+        logit "Successfully unpacked SentinelLM server software"
+else
+        _err_msg_="Problem unpacking SentinelLM server....Exiting"
+        abort_script "$_err_msg_"
+fi
+
+# Install the Sentinel configuration file for the Sentinel License server
+install_service_file
+if [ $? -eq 0 ]; then
+        logit "Successfully installed manifest for SentinelLM server"
+else
+        _err_msg_="Could not install SentinelLM manifest file"
+        abort_script "$_err_msg_"
+fi
+
+# Starts Sentinel Server by reloading the configuration file
+reload_service
+
+# Restart sentinel if the START_SENTINEL flag is set to true
+_sentinel_flag_file_=/var/tmp/sentinel_not_start
+if [ "$START_SENTINEL" == "false" ]; then
+    start_Sentinel ${ENIQ_SENTINEL_BIN_DIR} ${ENIQ_SENTINEL_ENV} ${LOGFILE}
+    if [ $? -eq 0 ]; then
+        if [ -f ${_sentinel_flag_file_} ]; then
+             logit "Sentinel is not allowed to start on this server"
+        else
+             logit "Successfully restarted Sentinel Server"
+        fi
+        $RM -rf ${_sentinel_flag_file_}
+    else
+                _err_msg_="Could not start SentinelLM"
+                abort_script "$_err_msg_"
+    fi
+elif [ "$START_SENTINEL" == "true" ]; then
+        start_sentinel_service
+    if [ $? -eq 0 ]; then
+        logit "Successfully restarted Sentinel Server"
+    else
+                _err_msg_="Could not start SentinelLM via Systemd"
+                abort_script "$_err_msg_"
+    fi
+
+else
+        _err_msg_="START_SENTINEL flag not set , Sentinel not started"
+        abort_script "$_err_msg_"
+fi
+}
+
+### Function: logit ###
+#
+#  Logs Messages to default logfile "LOGFILE"
+#
+# Arguments:  log_message
+# Return Values: 0 for success
+#                                1 for error LOGFILE undefined
+logit()
+{
+local _log_msg_
+_msg_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+if [ -n "${1}" ]; then
+    _log_msg_="${_msg_time_} - ${1}"
+else
+    _log_msg_="Error in Script $0 at ${_msg_time_}\n"
+fi
+
+if [ "${SENTINEL_LOGFILE}" ]; then
+    $ECHO "${_log_msg_}" | $TEE -a ${SENTINEL_LOGFILE}
+else
+    $ECHO "\n${_log_msg_}\n"
+fi
+}
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   set variable STORAGE_TYPE
+read_storage_type()
+{
+# Read the storage type
+if [ -s ${ENIQ_CONF_DIR}/${SUNOS_INI} ]; then
+    STORAGE_TYPE=`iniget STOR_TYPE -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v STORAGE_TYPE`
+else
+    if [ -s ${ENIQ_CONF_DIR}/san_details ]; then
+        STORAGE_TYPE=`$CAT ${ENIQ_CONF_DIR}/san_details | $EGREP "^STORAGE_TYPE=" | $AWK -F\= '{print $2}'`
+    fi
+fi
+
+if [ ! "${STORAGE_TYPE}" ]; then
+    logit "Could not read STORAGE_TYPE parameter"
+    return 1
+fi
+
+logit "Storage type set to ${STORAGE_TYPE}"
+}
+
+
+### Function: start_sentinel_service ###
+#
+#  Starts Sentinel service
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  SENTINEL_SERVICE_NAME
+start_sentinel_service()
+{
+$SYSTEMCTL enable ${SENTINEL_SERVICE_NAME}
+if [ $? -ne 0 ]; then
+        logit "ERROR: Enabling the Service for ${SENTINEL_SERVICE_NAME} "
+        return 1
+fi
+$SYSTEMCTL start ${SENTINEL_SERVICE_NAME}
+if [ $? -ne 0 ]; then
+        logit "ERROR: Starting the Service for ${SENTINEL_SERVICE_NAME} "
+        return 1
+else
+        logit "Started the Service for ${SENTINEL_SERVICE_NAME} "
+        return 0
+fi
+
+}
+
+### Function: stop_sentinel ###
+#
+#  Stops Sentinel service
+#
+# Arguments:  none
+# Return Values: 0 for success
+# Uses Global variables:  SENTINEL_SERVICE_NAME
+# set a flag if systemd is stopped by this function; I_STOPPED_SENTINEL
+#
+stop_sentinel()
+{
+logit "Stopping sentinel Systemd service ' ${SENTINEL_SERVICE_NAME} ' if it exists."
+
+_service_state=`$SYSTEMCTL show -p ActiveState ${SENTINEL_SERVICE_NAME} | $CUT -d "=" -f2 `
+_service_state_unit=`$SYSTEMCTL is-enabled ${SENTINEL_SERVICE_NAME} 2>/dev/null`
+
+if [ ! ${_service_state_unit} ]; then
+        logit "${SENTINEL_SERVICE_NAME} service does not exist, continuing."
+        return 0
+
+elif [ "${_service_state_unit}" == "disabled" ]; then
+        if [ "${_service_state}" == "inactive" ];then
+                logit "${SENTINEL_SERVICE_NAME} service already disabled"
+                return 0
+        else
+                logit "Stopping the ${SENTINEL_SERVICE_NAME} service"
+                $SYSTEMCTL stop ${SENTINEL_SERVICE_NAME}
+                if [ $? -ne 0 ]; then
+                        logit "ERROR: Stopping the Service for ${SENTINEL_SERVICE_NAME} "
+                        return 1
+                fi
+
+        fi
+elif [ "${_service_state_unit}" == "enabled" ]; then
+        logit "${SENTINEL_SERVICE_NAME} service is enabled"
+        $SYSTEMCTL stop ${SENTINEL_SERVICE_NAME}
+        if [ $? -ne 0 ]; then
+                logit "ERROR: Stopping the Service for ${SENTINEL_SERVICE_NAME} "
+                return 1
+        fi
+
+        $SYSTEMCTL disable ${SENTINEL_SERVICE_NAME}
+        if [ $? -eq 0 ]; then
+                I_STOPPED_SENTINEL="true"
+                logit "Stopped ${SENTINEL_SERVICE_NAME} service."
+                return 0
+        else
+                logit "ERROR: Problem disabling systemd for ${SENTINEL_SERVICE_NAME}."
+                return 1
+        fi
+else
+        logit "\nERROR:: ${SENTINEL_SERVICE_NAME} service in an unrecognised state; ${_service_state_unit} ;"
+        return 1
+fi
+}
+
+### Function: unpack_sentinel ###
+#
+#  Unzips the Sentinel Licensing Server file
+#
+# Arguments:  none
+# Return Values: 0 for success
+unpack_sentinel ()
+{
+$MKDIR -p ${TEMP_INST_DIR} >> ${SENTINEL_LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+        $ECHO "\nERROR:: running command $MKDIR -p ${TEMP_INST_DIR}"
+        return 1
+fi
+
+cd ${TEMP_INST_DIR}
+$GUNZIP -c ${SCRIPTHOME}/${SENTINEL_SERVER_FILE} | $TAR -xf - >> ${SENTINEL_LOGFILE} 2>&1
+if [ $? -ne 0 ]; then
+        logit "\nERROR:: running command $GUNZIP -c ${SCRIPTHOME}/${SENTINEL_SERVER_FILE} | $TAR -xf - "
+        return 1
+fi
+}
+
+### Function: usage ###
+#
+#  Prints the usage help.
+#
+# Arguments:     none
+# Return Values: none
+usage()
+{
+$ECHO "
+`$BASENAME $0` -a bin|systemd|remote|local [-c <license>] [ -e <environment_file> ] [-F] [-S]
+        -a <action>
+                Required parameter specifing what to install;
+                bin;    installs only sentinel license server binaries and libs (no smf)
+                systemd;installs only systemd for sentinel license server
+                remote; removes systemd for sentinel if installed locally
+                local;  installs both sentinel License Server and systemd locally
+        -c <license>
+                Optional parameter specifying the full path to license file containing sentinel licenses to install
+        -e <environment_file>
+                Optional parameter specifying the full path to an environment file.
+        -F
+                Force upgrade, even if newest version is installed.
+    -S
+        Start Sentinel service for Linux License Manager
+"
+}
+
+# ***********************************************************************
+#
+#                    Main body of program
+#
+# ***********************************************************************
+#
+# Determine absolute path to software
+get_absolute_path
+
+# Ensure there is not an old version of temporary files lying around.
+cleanup
+
+# FLAGS
+INSTALL_LICENSE="false"
+I_STOPPED_SENTINEL="false"
+# for now, always upgrade
+FORCE_INSTALL="true"
+START_SENTINEL="false"
+
+while getopts ":a:c:e:Fl:S" arg; do
+  case $arg in
+    a)  INSTALL_TYPE="$OPTARG"
+#        logit "Installation type set to '${INSTALL_TYPE}'"
+        ;;
+
+    c)  LICENSE_FILE="$OPTARG"
+        INSTALL_LICENSE="true"
+#       logit "License file '${LICENSE_FILE}' will be installed"
+        ;;
+
+    e)  ENVIRONMENT_FILE="$OPTARG"
+#        logit "Using environment file '${ENVIRONMENT_FILE}'"
+        ;;
+
+    F)  FORCE_INSTALL="true"
+ #       logit "Force install is set to '${FORCE_INSTALL}'"
+        ;;
+
+    l)  SENTINEL_LOGFILE="$OPTARG"
+        ;;
+
+    S)  START_SENTINEL="true"
+#        logit "Start systemd is set to '${START_SENTINEL}'"
+        ;;
+   \?)  usage
+                _err_msg_="Input arguments specified not recognised"
+                abort_script "$_err_msg_"
+        ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! -s ${ENIQ_LIB_DIR}/common_functions.lib ]; then
+    _err_msg_="Cannot locate ${ENIQ_LIB_DIR}/common_functions.lib"
+    abort_script "$_err_msg_"
+else
+   . ${ENIQ_LIB_DIR}/common_functions.lib
+fi
+
+if [ ! "${SENTINEL_LOGFILE}" ]; then
+        if [ -d "/eniq/local_logs/" ]; then
+            readonly SENTINEL_LOGFILE=/eniq/local_logs/sentinel/sentinel_install.log
+        else
+            readonly SENTINEL_LOGFILE=/tmp/Sentinel_install.log.$$
+        fi
+fi
+
+# Check/Create Logfile
+chk_create_logfile
+
+if [ ! "${INSTALL_TYPE}" ]; then
+        usage
+        _err_msg_="Installation not recognised. Invalid -a parameter used"
+        abort_script "$_err_msg_"
+fi
+
+$ECHO "\tOptions set using command line arguments:" >> ${SENTINEL_LOGFILE}
+$ECHO "\tInstallation type set to '${INSTALL_TYPE}'" >> ${SENTINEL_LOGFILE}
+if [ "${LICENSE_FILE}" ]; then
+        $ECHO "\tLicense file '${LICENSE_FILE}' will be installed" >> ${SENTINEL_LOGFILE}
+fi
+if [ "${ENVIRONMENT_FILE}" ]; then
+        $ECHO "\tUsing environment file '${ENVIRONMENT_FILE}'" >> ${SENTINEL_LOGFILE}
+fi
+$ECHO "\tForce install is set to '${FORCE_INSTALL}'" >> ${SENTINEL_LOGFILE}
+$ECHO "\tStart systemd is set to '${START_SENTINEL}'" >> ${SENTINEL_LOGFILE}
+
+$ECHO "\nPreparing to install SentinelLM license server\n" | $TEE -a ${SENTINEL_LOGFILE}
+
+case "${INSTALL_TYPE}" in
+       bin) install_sentinel_binaires_only
+            ;;
+
+       systemd) install_systemd_only
+            ;;
+
+     local) install_sentinel_binaires_and_SYSTEMD
+             ;;
+
+    remote) delete_SMF
+            ;;
+
+         *) # SHOULD NOT GET HERE
+                usage
+                        _err_msg_="Installation not recognised. Invalid -a parameter used"
+                        abort_script "$_err_msg_"
+            ;;
+esac
+
+
+# Add Sentinel Licenses
+if [ "${INSTALL_LICENSE}" == "true" ]; then
+        if [ -s ${LICENSE_FILE} ]; then
+                logit "License file found. Preparing to add SentinelLM licenses"
+                add_licenses
+                if [ $? -eq 0 ]; then
+                        logit "Successfully added SentinelLM licenses"
+                else
+                        _err_msg_="Could not add SentinelLM licenses from '${LICENSE_FILE}'"
+                        abort_script "$_err_msg_"
+                fi
+        else
+                _err_msg_="Could not find licence file - '${LICENSE_FILE}'"
+                abort_script "$_err_msg_"
+        fi
+fi
+
+$ECHO "\n\nSuccessfully completed ENIQ SentinelLM installation script\n" | $TEE -a ${SENTINEL_LOGFILE}
+
+# Remove temporary files
+cleanup
+
+exit 0
